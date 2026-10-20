@@ -7,8 +7,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Changed
+
+* Highlight the first out-of-order element in `ParameterMetaOrder` diagnostics
+  and provide contextual labels pointing to its definition and declaration
+  ([#1284](https://github.com/stjude-rust-labs/sprocket/issues/1284)).
+
 ### Fixed
 
+* Fixed `ParameterMetaOrder` diagnostic messages referring to `struct` members
+  as "inputs" instead of "fields"
+  ([#1284](https://github.com/stjude-rust-labs/sprocket/issues/1284)).
 * `MetaSections` lint rule no longer requires `parameter_meta` for `struct`s whose members are fully
   documented by doc comments ([#1285](https://github.com/stjude-rust-labs/sprocket/pull/1285)).
 

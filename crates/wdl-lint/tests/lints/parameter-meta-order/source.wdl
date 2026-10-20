@@ -44,3 +44,25 @@ task parameter_meta_order_task {
         echo "~{first} ~{second}"
     >>>
 }
+
+task more_parameters {
+    parameter_meta {
+        first: "The first input"
+        third: "The third input"
+        second: "The second input"
+    }
+
+    input {
+        String first
+        String second
+        String third
+    }
+
+    requirements {
+        container: "ubuntu@sha256:cc925e589b7543b910fea57a240468940003fbfc0515245a495dd0ad8fe7cef1"
+    }
+
+    command <<<
+        echo "~{first} ~{second} ~{third}"
+    >>>
+}
