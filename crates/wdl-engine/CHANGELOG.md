@@ -7,8 +7,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Added
+
+* Added the `backends.<name>.resource_usage_interval` Docker configuration option for sampling task
+  memory and CPU usage. Local containers are sampled every second by default; set the interval to
+  `0` to disable sampling. Docker Swarm sampling is unsupported
+  ([#1259](https://github.com/stjude-rust-labs/sprocket/pull/1259)).
+* The LSF and Slurm backends report task resource utilization through Crankshaft's cumulative
+  `TaskResourceUsage` event. LSF sources measurements from `bjobs`; Slurm uses `sacct`
+  ([#1259](https://github.com/stjude-rust-labs/sprocket/pull/1259)).
+* `TaskConstraintsSnapshot` now records the resolved retry policy and curated hints (`max_retries`,
+  `preemptible`, `max_cpu`, and `max_memory`) alongside the constraints
+  ([#1261](https://github.com/stjude-rust-labs/sprocket/pull/1261)).
+* `EngineEvent` gained a `TaskDiskUsage` event reporting the disk space used by an execution
+  attempt's work directory, measured by the engine at the attempt's termination when the work
+  directory is on a local file system. This complements the scheduler-observed measurements a
+  backend may report through Crankshaft's `TaskResourceUsage` event
+  ([#1261](https://github.com/stjude-rust-labs/sprocket/pull/1261)).
+
 ### Changed
 
+* The configuration settings `http.cache_dir`, `task.cache_dir` and the `image_cache_dir` of
+  LSF/Slurm backends are now relative to the output directory instead of being user-wide cache
+  locations; the previous `system` value is deprecated
+  ([#1372](https://github.com/stjude-rust-labs/sprocket/pull/1372)).
+
+## 0.20.0 - 2026-10-29
+
+### Added
+
+* Added `storage.s3.endpoint` configuration setting for allowing custom S3 endpoints other than AWS
+  ([#1335](https://github.com/stjude-rust-labs/sprocket/pull/1335)).
+* Added the WDL 1.4 `list` function from
+  [`openwdl/wdl#800`](https://github.com/openwdl/wdl/pull/800), returning a pair of file and
+  directory arrays with optional recursion, symlink inclusion, and basename glob filtering. WDL 1.4
+  documents accept a broken symbolic link as a `File` value when it is evaluated, because `list`
+  returns broken links as files ([#1198](https://github.com/stjude-rust-labs/sprocket/pull/1198)).
+
+### Changed
+
+* Call cache lookup now occurs on each retry of a task's execution
+  ([#1326](https://github.com/stjude-rust-labs/sprocket/pull/1326)).
+* Replaced `Events::new` method with builders for each specific events channel
+  ([#1303](https://github.com/stjude-rust-labs/sprocket/pull/1303)).
 * The non-exhaustive `EngineEvent` enum now reports execution metrics: `TaskInitializing` carries
   the 0-based attempt number; `TaskExecuting` carries a non-exhaustive, serializable
   `TaskConstraintsSnapshot` of the resolved resource constraints, including the full container URI;
@@ -19,6 +60,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   evaluator uses that override so any later retry links from the execution that actually failed; for
   example, a failed TES resubmission links `base~1` to the next evaluator attempt rather than
   linking `base` twice ([#1255](https://github.com/stjude-rust-labs/sprocket/pull/1255)).
+* `Evaluator::evaluate_workflow` now requires the defining workflow name and evaluates that workflow
+  explicitly. This breaking API change also enables WDL 1.4 workflows to call other workflows in the
+  same document ([openwdl/wdl#798](https://github.com/openwdl/wdl/pull/798)).
 
 ### Fixed
 

@@ -43,6 +43,10 @@
     "modules": {
       "description": "Configuration for the module system (`[modules]` section).",
       "$ref": "#/$defs/ModulesConfig"
+    },
+    "lock": {
+      "description": "Configuration for the `lock` command.",
+      "$ref": "#/$defs/LockConfig"
     }
   },
   "additionalProperties": false,
@@ -389,6 +393,9 @@
             },
             "UnusedDocComments": {
               "severity": "note"
+            },
+            "StructOverMap": {
+              "severity": "off"
             }
           }
         }
@@ -788,6 +795,13 @@
           "$ref": "#/$defs/UnusedDocCommentsConfig",
           "default": {
             "severity": "note"
+          }
+        },
+        "StructOverMap": {
+          "description": "The `StructOverMap` rule.",
+          "$ref": "#/$defs/StructOverMapConfig",
+          "default": {
+            "severity": "off"
           }
         }
       },
@@ -1597,6 +1611,18 @@
       },
       "additionalProperties": false
     },
+    "StructOverMapConfig": {
+      "description": "Configuration for the `StructOverMap` lint rule.",
+      "type": "object",
+      "properties": {
+        "severity": {
+          "description": "The severity of the rule's diagnostics: `off`, `note` or `warning`.",
+          "$ref": "#/$defs/RuleSeverity",
+          "default": "off"
+        }
+      },
+      "additionalProperties": false
+    },
     "AnalyzerConfig": {
       "description": "Represents the configuration for the Sprocket `analyzer` command.",
       "type": "object",
@@ -1613,6 +1639,11 @@
       "description": "Represents the configuration for the Sprocket `run` command.",
       "type": "object",
       "properties": {
+        "output_dir": {
+          "description": "The output directory (default: `./out`).\n\nIndividual runs are stored at `<output_dir>/runs/<target>/<timestamp>/`.",
+          "type": "string",
+          "default": "./out"
+        },
         "http": {
           "description": "HTTP configuration.",
           "$ref": "#/$defs/HttpConfig"
@@ -1676,11 +1707,6 @@
           "minimum": 1,
           "default": 1000
         },
-        "output_dir": {
-          "description": "The output directory (default: `./out`).\n\nIndividual runs are stored at `<output_dir>/runs/<target>/<timestamp>/`.",
-          "type": "string",
-          "default": "./out"
-        },
         "events_capacity": {
           "description": "The capacity of the events channel used to display progress statistics.\n\nIf the number of progress events being generated outpaces Sprocket's\nability to read the events for displaying the progress statistics and\nthe channel reaches its capacity, Sprocket will stop displaying progress\nstatistics. This is most likely to occur when Sprocket has concurrently\nqueued up a large number of tasks.\n\nIncreasing the capacity will increase the size of the memory allocation\nmade by the events channel.\n\nThe default is `5000`.",
           "type": "integer",
@@ -1696,9 +1722,9 @@
       "type": "object",
       "properties": {
         "cache_dir": {
-          "description": "The HTTP download cache location.\n\nDefaults to an operating system specific cache directory for the user.",
+          "description": "The HTTP download cache location.\n\nThe specified directory is relative to the output directory.\n\nDefault cache directory is `cache/downloads`.",
           "type": "string",
-          "default": "system"
+          "default": "default"
         },
         "retries": {
           "description": "The number of retries for transferring files.",
@@ -1793,9 +1819,9 @@
           "$ref": "#/$defs/TaskResourceLimitBehavior"
         },
         "cache_dir": {
-          "description": "The call cache directory to use for caching task execution results.\n\nDefaults to an operating system specific cache directory for the user.",
+          "description": "The call cache directory to use for caching task execution results.\n\nThe specified directory is relative to the output directory.\n\nDefaults to `cache/calls`.",
           "type": "string",
-          "default": "system"
+          "default": "default"
         },
         "cache": {
           "description": "The call caching mode to use for tasks.",
@@ -1947,6 +1973,16 @@
               "description": "Whether or not to remove a task's container after the task completes.\n\nDefaults to `true`.",
               "type": "boolean",
               "default": true
+            },
+            "resource_usage_interval": {
+              "description": "The interval, in seconds, at which to sample a running container's\nresource usage.\n\nEach task's peak and average memory and cumulative CPU time\nare sampled from the Docker daemon at this interval and reported in\nthe run's metrics.\n\nDefaults to one second. Set to zero to disable sampling. Sampling\napplies only to local container execution, not Docker Swarm services.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0,
+              "default": 1
             }
           },
           "required": [
@@ -2416,9 +2452,9 @@
           "default": "apptainer"
         },
         "image_cache_dir": {
-          "description": "Path to a shared directory for caching pulled `.sif` images.\n\nDefaults to an operating system specific cache directory for the user.",
+          "description": "Path to a shared directory for caching pulled `.sif` images.\n\nThe specified directory is relative to the output directory.\n\nDefaults to `cache/images`.",
           "type": "string",
-          "default": "system"
+          "default": "default"
         },
         "extra_args": {
           "description": "Additional command-line arguments to pass to `apptainer exec` when\nexecuting tasks.",
@@ -2529,6 +2565,14 @@
             "string",
             "null"
           ]
+        },
+        "endpoint": {
+          "description": "The custom endpoint URL to use for S3.\n\nUses the default AWS endpoints when `None`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri"
         },
         "auth": {
           "description": "The AWS S3 storage authentication configuration.",
@@ -2644,11 +2688,6 @@
           "description": "Database configuration.",
           "$ref": "#/$defs/DatabaseConfig"
         },
-        "output_dir": {
-          "description": "Directory for workflow outputs.",
-          "type": "string",
-          "default": "./out"
-        },
         "allowed_file_paths": {
           "description": "Allowed file paths for file-based workflows.",
           "type": "array",
@@ -2661,7 +2700,8 @@
           "description": "Allowed URL prefixes for URL-based workflows.",
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "format": "uri"
           },
           "default": []
         },
@@ -2715,6 +2755,11 @@
       "description": "Represents WDL evaluation configuration.\n\n<div class=\"warning\">\n\nBy default, serialization of [`Config`] will not redact the values of\nsecrets.\n\nUse the [`Config::redact`] method prior to serialization to redact secrets.\n\n</div>",
       "type": "object",
       "properties": {
+        "output_dir": {
+          "description": "The output directory (default: `./out`).\n\nIndividual runs are stored at `<output_dir>/runs/<target>/<timestamp>/`.",
+          "type": "string",
+          "default": "./out"
+        },
         "http": {
           "description": "HTTP configuration.",
           "$ref": "#/$defs/HttpConfig"
@@ -2804,12 +2849,24 @@
             "null"
           ]
         },
+        "bin_dir": {
+          "description": "Directory containing executable files to run for custom assertions.\n\nIf not set, executables are resolved from `<workspace>/test/bin`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "run_dir": {
           "description": "Directory to use for executing tests.\n\nIf not set, runs are written to `<workspace>/test/runs`.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "enable_custom_assertions": {
+          "description": "Whether to enable arbitrary code execution for custom test assertions.\n\n**Warning:** this may run arbitrary user code on the host machine!",
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false,
@@ -3272,6 +3329,32 @@
           "const": "confirm"
         }
       ]
+    },
+    "LockConfig": {
+      "description": "Configuration for the `lock` subcommand.",
+      "type": "object",
+      "properties": {
+        "library": {
+          "description": "Configuration for locking [Library API](https://singularityhub.github.io/library-api) images.",
+          "$ref": "#/$defs/LibraryLockConfig"
+        }
+      },
+      "additionalProperties": false
+    },
+    "LibraryLockConfig": {
+      "description": "Configuration for locking [Library API](https://singularityhub.github.io/library-api) images.",
+      "type": "object",
+      "properties": {
+        "registry": {
+          "description": "The default registry to download images from.\n\nFor `library://` container images that *don't* specify a registry (e.g.,\n`library://sylabs/default/alpine:3.18`), this is the registry that will\nbe used.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

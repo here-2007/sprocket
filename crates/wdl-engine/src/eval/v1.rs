@@ -25,9 +25,12 @@ use wdl_analysis::Document;
 use wdl_analysis::types::EnumChoiceCacheKey;
 use wdl_ast::AstToken;
 use wdl_ast::Diagnostic;
+use wdl_ast::SupportedVersion;
+use wdl_ast::version::V1;
 
 use super::CancellationContext;
 use super::Events;
+use crate::ContainerImageOverrides;
 use crate::Engine;
 use crate::EngineEvent;
 use crate::EvaluationHttpClient;
@@ -57,6 +60,14 @@ fn write_json_file(path: impl AsRef<Path>, value: &impl Serialize) -> Result<()>
         .with_context(|| format!("failed to write file `{path}`", path = path.display()))
 }
 
+/// Determines if a document's `File` values may be broken symbolic links.
+///
+/// WDL 1.4 `list` returns broken symbolic links as files, so they must remain
+/// valid after they are bound to declarations.
+fn allows_broken_symlinks(document: &Document) -> bool {
+    document.version() >= Some(SupportedVersion::V1(V1::Four))
+}
+
 /// The inner state of [`Evaluator`].
 struct EvaluatorInner {
     /// The engine associated with the evaluator.
@@ -80,6 +91,10 @@ struct EvaluatorInner {
     regex_cache: Mutex<LruCache<String, Result<Regex, regex::Error>>>,
     /// The digest calculator to use for files and directories.
     digests: DigestCalculator,
+    /// Container image overrides.
+    ///
+    /// See [`ContainerImageOverrides`].
+    image_overrides: Arc<ContainerImageOverrides>,
 }
 
 /// Represents a WDL 1.x evaluator.
@@ -100,7 +115,12 @@ pub struct Evaluator(Arc<EvaluatorInner>);
 impl Evaluator {
     /// Constructs a new evaluator with the given engine, events, and
     /// cancellation context.
-    pub(crate) fn new(engine: &Engine, events: Events, cancellation: CancellationContext) -> Self {
+    pub(crate) fn new(
+        engine: &Engine,
+        events: Events,
+        cancellation: CancellationContext,
+        image_overrides: ContainerImageOverrides,
+    ) -> Self {
         let http_client = EvaluationHttpClient::new(engine, &events);
 
         let digests = DigestCalculator::new(
@@ -127,9 +147,15 @@ impl Evaluator {
                         .expect("expected a non-zero regex cache capacity"),
                 )),
                 digests,
+                image_overrides: Arc::new(image_overrides),
             }
             .into(),
         )
+    }
+
+    /// Gets the [`ContainerImageOverrides`] associated with the evaluator.
+    fn image_overrides(&self) -> &ContainerImageOverrides {
+        &self.0.image_overrides
     }
 
     /// Gets the [`Engine`] associated with the evaluator.
@@ -201,6 +227,17 @@ impl Evaluator {
             let _ = sender.send(EngineEvent::TaskExecuting {
                 name: name.to_string(),
                 constraints,
+            });
+        }
+    }
+
+    /// Notifies of the disk space used by a task execution attempt's work
+    /// directory.
+    fn notify_task_disk_usage(&self, name: &str, disk_used: u64) {
+        if let Some(sender) = &self.0.events.engine {
+            let _ = sender.send(EngineEvent::TaskDiskUsage {
+                name: name.to_string(),
+                disk_used,
             });
         }
     }

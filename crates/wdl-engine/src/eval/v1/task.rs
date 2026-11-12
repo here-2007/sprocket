@@ -10,6 +10,7 @@ use std::io::BufRead;
 use std::mem;
 use std::path::Component;
 use std::path::Path;
+use std::path::PathBuf;
 use std::path::absolute;
 use std::sync::Arc;
 
@@ -67,6 +68,7 @@ use super::Evaluator;
 use crate::CancellationContextState;
 use crate::Coercible;
 use crate::CompoundValue;
+use crate::ContainerImageOverrides;
 use crate::ContentKind;
 use crate::EngineEvent;
 use crate::EvaluationContext;
@@ -107,6 +109,7 @@ use crate::eval::ScopeIndex;
 use crate::eval::ScopeRef;
 use crate::eval::TaskConstraintsSnapshot;
 use crate::eval::trie::InputTrie;
+use crate::path::is_broken_symlink;
 use crate::path::is_file_url;
 use crate::path::is_supported_url;
 use crate::stdlib::download_file;
@@ -186,7 +189,7 @@ fn parse_storage_value(value: &Value, error_message: impl Fn(&str) -> String) ->
 /// The returned remainder is always cleaned.
 ///
 /// Returns `None` if the given path is not prefixed with the given base path.
-fn strip_path_prefix(path: impl AsRef<Path>, base: impl AsRef<Path>) -> Option<String> {
+fn strip_path_prefix(path: impl AsRef<Path>, base: impl AsRef<Path>) -> Option<PathBuf> {
     let remainder = clean(path.as_ref().strip_prefix(base.as_ref()).ok()?);
 
     // If the cleaned remainder starts with a parent directory reference,
@@ -195,7 +198,28 @@ fn strip_path_prefix(path: impl AsRef<Path>, base: impl AsRef<Path>) -> Option<S
         return None;
     }
 
-    remainder.into_os_string().into_string().ok()
+    Some(remainder)
+}
+
+/// Utility function for normalizing [`Path`]s to use unix-style separators.
+///
+/// Returns `None` is the path is not UTF-8.
+fn unix_path(path: impl AsRef<Path>) -> Option<String> {
+    let mut components = path.as_ref().components();
+    let Some(first) = components.next() else {
+        return Some(String::new());
+    };
+
+    let path = first.as_os_str().to_str()?.to_string();
+    components
+        .map(|c| c.as_os_str().to_str())
+        // Guest paths always use `/`; join components rather than
+        // replacing `\`, which a Unix file name may contain
+        .fold_options(path, |mut acc, component| {
+            acc.push('/');
+            acc.push_str(component);
+            acc
+        })
 }
 
 /// Utility function for stripping the path prefix of a URL given a base URL.
@@ -207,12 +231,37 @@ fn strip_url_path_prefix(url: &Url, base: &Url) -> Option<String> {
     if url.scheme() == base.scheme()
         && url.authority() == base.authority()
         && url.host_str() == base.host_str()
-        && url.port() == base.port()
+        && url.port_or_known_default() == base.port_or_known_default()
     {
-        return strip_path_prefix(url.path(), base.path());
+        return strip_path_prefix(url.path(), base.path())
+            .map(PathBuf::into_os_string)
+            .and_then(|s| s.into_string().ok());
     }
 
     None
+}
+
+/// Recursively computes the total size, in bytes, of the files in a
+/// directory.
+///
+/// Symbolic links are not followed and contribute nothing to the total, so
+/// links back into the inputs (or elsewhere) are not counted as space used by
+/// the directory.
+fn directory_size(dir: &Path) -> std::io::Result<u64> {
+    let mut total = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            total += directory_size(&entry.path())?;
+        } else {
+            total += metadata.len();
+        }
+    }
+    Ok(total)
 }
 
 /// Used to evaluate expressions in tasks.
@@ -357,8 +406,8 @@ impl EvaluationContext for TaskEvaluationContext<'_, '_> {
         (
             self.state.evaluator.http_client(),
             // After the task has executed, use the second cancellation token
-            // This ensures that the `output` section is evaluated even if the first cancellation
-            // token has been signaled
+            // This ensures that the `output` section is evaluated even if the
+            // first cancellation token has been signaled
             if self.post_execution {
                 self.state.evaluator.cancellation().second()
             } else {
@@ -506,12 +555,20 @@ impl<'a> State<'a> {
     ///
     /// This method also ensures that a `File` or `Directory` paths exist for
     /// WDL 1.2+.
+    ///
+    /// For WDL 1.4+, a `File` that is a broken symbolic link is not added as a
+    /// backend input because it has no content to mount. If an existing
+    /// directory input contains the link, the link maps to its path within
+    /// that directory; otherwise, it maps to a reserved guest path where
+    /// nothing is mounted.
     async fn add_backend_inputs(
         &mut self,
         is_optional: bool,
         value: &mut Value,
         cacheable: bool,
     ) -> Result<()> {
+        let allow_broken_symlinks = super::allows_broken_symlinks(self.document);
+
         // For WDL 1.2 documents, start by ensuring paths exist.
         // This will replace any non-existent optional paths with `None`
         if self
@@ -523,6 +580,7 @@ impl<'a> State<'a> {
             *value = value
                 .resolve_paths(
                     is_optional,
+                    allow_broken_symlinks,
                     self.base_dir.as_local(),
                     Some((
                         self.evaluator.http_client(),
@@ -536,6 +594,26 @@ impl<'a> State<'a> {
         // Add inputs to the backend
         let mut urls = Vec::new();
         value.visit_paths(&mut |is_file, path| {
+            // A broken symbolic link has no content to localize or mount, so
+            // map it without adding a backend input
+            if is_file && allow_broken_symlinks {
+                let joined = self.base_dir.join(path.as_str())?;
+                if let Some(local) = joined.as_local()
+                    && is_broken_symlink(local)
+                {
+                    let guest_path = match self.guest_path_in_directory_input(local) {
+                        Some(guest_path) => Some(guest_path),
+                        None => self.backend_inputs.reserve_guest_path(local)?,
+                    };
+
+                    if let Some(guest_path) = guest_path {
+                        self.path_map.insert(path.clone(), guest_path);
+                    }
+
+                    return Ok(());
+                }
+            }
+
             // Insert a backend input for the path
             if let Some(index) = self.insert_backend_input(
                 if is_file {
@@ -649,7 +727,10 @@ impl<'a> State<'a> {
             for (host, guest) in self.path_map.iter() {
                 // Check to see if the provided guest path is prefixed by this
                 // entry
-                if let Some(remainder) = strip_path_prefix(path, guest) {
+                if let Some(remainder) = strip_path_prefix(path, guest)
+                    .map(PathBuf::into_os_string)
+                    .and_then(|s| s.into_string().ok())
+                {
                     // If the host is a URL, parse it and join it with the
                     // remainder
                     if is_supported_url(host.as_str()) {
@@ -677,6 +758,36 @@ impl<'a> State<'a> {
         })
     }
 
+    /// Gets the guest path of a local path within the most specific directory
+    /// input that contains it.
+    ///
+    /// Unlike `guest_path`, this compares against the resolved paths of the
+    /// inputs, so it also matches inputs specified as relative paths or `file`
+    /// URLs.
+    ///
+    /// Returns `None` if no directory input with a guest path contains the
+    /// path.
+    fn guest_path_in_directory_input(&self, path: &Path) -> Option<GuestPath> {
+        let (_, guest_path, remainder) = self
+            .backend_inputs
+            .as_slice()
+            .iter()
+            .filter(|input| input.kind() == ContentKind::Directory)
+            .filter_map(|input| {
+                let directory = input.path().as_local()?;
+                let remainder = strip_path_prefix(path, directory)?;
+                Some((
+                    directory.components().count(),
+                    input.guest_path()?,
+                    remainder,
+                ))
+            })
+            .max_by_key(|(len, ..)| *len)?;
+
+        let remainder = unix_path(remainder)?;
+        Some(GuestPath::new(format!("{guest_path}/{remainder}")))
+    }
+
     /// Gets a guest path representation of a host path.
     ///
     /// Returns `None` if there is no guest path representation of the host
@@ -702,12 +813,11 @@ impl<'a> State<'a> {
 
                 match (&path_url, &host_url) {
                     (None, None) => {
-                        if let Some(remainder) = strip_path_prefix(path, host) {
+                        if let Some(remainder) = strip_path_prefix(path, host)
+                            && let Some(remainder) = unix_path(remainder)
+                        {
                             // Note: guest paths are always Unix-style paths
-                            return Some(GuestPath::new(format!(
-                                "{guest}/{remainder}",
-                                remainder = remainder.replace('\\', "/")
-                            )));
+                            return Some(GuestPath::new(format!("{guest}/{remainder}",)));
                         }
                     }
                     (Some(path_url), Some(host_url)) => {
@@ -1142,6 +1252,7 @@ impl<'a> State<'a> {
         id: &str,
         definition: &TaskDefinition<SyntaxNode>,
         inputs: &TaskInputs,
+        image_overrides: &ContainerImageOverrides,
         attempt: u64,
         previous_task_data: Option<Arc<TaskPostEvaluationData>>,
     ) -> EvaluationResult<EvaluatedSections> {
@@ -1213,7 +1324,7 @@ impl<'a> State<'a> {
             .evaluator
             .engine()
             .backend()
-            .constraints(inputs, &requirements, &hints)
+            .constraints(inputs, &requirements, image_overrides, &hints)
             .with_context(|| {
                 format!(
                     "failed to get constraints for task `{task}`",
@@ -1316,6 +1427,7 @@ impl<'a> State<'a> {
         value = value
             .resolve_paths(
                 ty.is_optional(),
+                super::allows_broken_symlinks(self.document),
                 self.base_dir.as_local(),
                 Some((
                     self.evaluator.http_client(),
@@ -1458,7 +1570,8 @@ impl<'a> State<'a> {
                     input.local_path(),
                     input.guest_path(),
                 ) {
-                    // Input is unmapped and either local or remote and not downloaded
+                    // Input is unmapped and either local or remote and not
+                    // downloaded
                     (true, _, None) | (false, None, None) => {}
                     // Input is local and was mapped to a guest path
                     (true, _, Some(guest_path)) => {
@@ -1481,7 +1594,8 @@ impl<'a> State<'a> {
                             local_path = local_path.display()
                         );
                     }
-                    // Input is remote and was not downloaded, but mapped to a guest path
+                    // Input is remote and was not downloaded, but mapped to a
+                    // guest path
                     (false, None, Some(guest_path)) => {
                         debug!(
                             task_id,
@@ -1491,7 +1605,8 @@ impl<'a> State<'a> {
                             path = input.path(),
                         );
                     }
-                    // Input is remote and was both downloaded and mapped to a guest path
+                    // Input is remote and was both downloaded and mapped to a
+                    // guest path
                     (false, Some(local_path), Some(guest_path)) => {
                         debug!(
                             task_id,
@@ -1709,6 +1824,7 @@ impl Evaluator {
                     id,
                     &definition,
                     &inputs,
+                    self.image_overrides(),
                     attempt,
                     previous_task_data.clone(),
                 )
@@ -1729,19 +1845,16 @@ impl Evaluator {
             // Localize the inputs now
             state.localize_inputs(id).await?;
 
-            // Calculate the cache key on the first attempt only
-            let mut key = if attempt == 0
-                && let Some(cache) = self.engine().call_cache()
-            {
+            // Calculate the cache key
+            let mut key = if let Some(cache) = self.engine().call_cache() {
                 if hints::cacheable(&inputs, &hints, self.engine().config()) {
                     // The configured default container is only part of the
-                    // cache key when the task has no
-                    // `container` requirement of its own. When
-                    // the task does specify `container`, the requirement is
-                    // already covered by the `requirements`
-                    // digest, so including the default here
-                    // would be redundant; when it doesn't, a change to the
-                    // configured default must invalidate the cache entry.
+                    // cache key when the task has no `container` requirement of
+                    // its own. When the task does specify `container`, the
+                    // requirement is already covered by the `requirements`
+                    // digest, so including the default here would be redundant;
+                    // when it doesn't, a change to the configured default must
+                    // invalidate the cache entry.
                     let default_container =
                         if requirements::has_container_requirement(&inputs, &requirements) {
                             None
@@ -1841,8 +1954,7 @@ impl Evaluator {
                         }
 
                         // We're serving the results from the call cache; no
-                        // need to update, so set
-                        // the key to `None`
+                        // need to update, so set the key to `None`
                         key = None;
                         Some(results)
                     }
@@ -1877,11 +1989,13 @@ impl Evaluator {
                     attempt_dir.push(attempt.to_string());
 
                     // Notify that the attempt is being submitted for
-                    // execution, along with its resolved constraints.
-                    self.notify_task_executing(
-                        &state.task_name,
-                        TaskConstraintsSnapshot::from(&constraints),
-                    );
+                    // execution, along with its resolved constraints and the
+                    // curated hints and retry policy that inform metrics.
+                    let mut snapshot = TaskConstraintsSnapshot::new(&constraints, max_retries);
+                    snapshot.preemptible = hints::preemptible(&inputs, &hints).ok();
+                    snapshot.max_cpu = hints::max_cpu(&inputs, &hints);
+                    snapshot.max_memory = hints::max_memory(&inputs, &hints).ok().flatten();
+                    self.notify_task_executing(&state.task_name, snapshot);
 
                     match self
                         .engine()
@@ -1913,6 +2027,30 @@ impl Evaluator {
                     }
                 }
             };
+
+            // Report the disk space used by the attempt's work directory when
+            // it is on a local file system. This is best-effort and skipped
+            // for cached results.
+            if !cached && let Some(work_dir) = result.work_dir.as_local() {
+                let work_dir = work_dir.to_path_buf();
+                match tokio::task::spawn_blocking(move || directory_size(&work_dir)).await {
+                    Ok(Ok(disk_used)) => {
+                        self.notify_task_disk_usage(&state.task_name, disk_used);
+                    }
+                    Ok(Err(e)) => {
+                        debug!(
+                            "failed to measure work directory size for task `{name}`: {e:#}",
+                            name = state.task.name()
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            "failed to measure work directory size for task `{name}`: {e:#}",
+                            name = state.task.name()
+                        );
+                    }
+                }
+            }
 
             // Update the task variable for the execution result
             if version >= SupportedVersion::V1(V1::Two) {
@@ -2116,12 +2254,14 @@ impl Evaluator {
                 continue;
             }
 
-            // Find a known guest path that starts the given guest path
-            // If there isn't one, it's an error
+            // Find the most specific known guest path that starts the given
+            // guest path, as a broken link input may be mapped within a
+            // directory input; if there isn't one, it's an error
             let Some(guest) = state
                 .path_map
                 .right_values()
-                .find(|p| symlink_guest_path.starts_with(p))
+                .filter(|p| symlink_guest_path.starts_with(p))
+                .max_by_key(|p| p.as_ref().components().count())
             else {
                 bail!(
                     "`{path}` links to guest path `{link_path}` but it is not to a task input or \
@@ -2300,14 +2440,18 @@ mod tests {
     use wdl_analysis::Analyzer;
     use wdl_analysis::Config as AnalysisConfig;
     use wdl_analysis::DiagnosticsConfig;
+    use wdl_analysis::FeatureFlags;
 
     use crate::CancellationContext;
     use crate::CancellationContextState;
+    use crate::ContainerImageOverrides;
     use crate::Engine;
     use crate::EngineEvent;
     use crate::EvaluationPath;
     use crate::Events;
     use crate::Object;
+    #[cfg(unix)]
+    use crate::Outputs;
     use crate::PrimitiveValue;
     use crate::RetryCause;
     use crate::TaskInputs;
@@ -2320,6 +2464,7 @@ mod tests {
     use crate::config::DockerBackendConfig;
     use crate::config::FailureMode;
     use crate::config::LocalBackendConfig;
+    use crate::config::RetryConfig;
     use crate::eval::EvaluatedTask;
     use crate::http::tests::NotImplementedHttpClient;
     use crate::resubmit_task_name;
@@ -2345,6 +2490,7 @@ mod tests {
             &self,
             _inputs: &TaskInputs,
             _requirements: &Object,
+            _image_overrides: &ContainerImageOverrides,
             _hints: &Object,
         ) -> Result<TaskExecutionConstraints> {
             Ok(TaskExecutionConstraints {
@@ -2415,7 +2561,7 @@ mod tests {
     fn create_config(mode: CallCachingMode, root_dir: &Path) -> Config {
         let mut config = Config::default();
         config.task.cache = mode;
-        config.task.cache_dir = root_dir.join("cache").to_string_lossy().into();
+        config.task.cache_dir = root_dir.join("cache");
         config
             .backends
             .insert("default".into(), DockerBackendConfig::default().into());
@@ -2442,7 +2588,9 @@ mod tests {
 
         // Analyze the source file
         let analyzer = Analyzer::new(
-            AnalysisConfig::default().with_diagnostics_config(DiagnosticsConfig::except_all()),
+            AnalysisConfig::default()
+                .with_diagnostics_config(DiagnosticsConfig::except_all())
+                .with_feature_flags(FeatureFlags::default().with_wdl_1_4()),
             |(), _, _, _| async {},
         );
         analyzer
@@ -2455,9 +2603,13 @@ mod tests {
             .expect("failed to analyze document");
         assert_eq!(results.len(), 1, "expected only one result");
         let document = results.first().expect("should have result").document();
-        let events = Events::new(100);
+        let events = Events::default().with_engine(100);
         let mut receiver = events.subscribe_engine().unwrap();
-        let evaluator = engine.create_v1_evaluator(events, CancellationContext::default());
+        let evaluator = engine.create_v1_evaluator(
+            events,
+            CancellationContext::default(),
+            ContainerImageOverrides::default(),
+        );
         let runs_dir = root_dir.join("runs");
         let evaluated = evaluator
             .evaluate_task(
@@ -2482,6 +2634,53 @@ mod tests {
     /// Helper for evaluating a simple task with the given call cache mode.
     async fn evaluate_task(config: Config, root_dir: &Path, source: &str) -> EvaluatedTask {
         evaluate_task_with_events(config, root_dir, source).await.0
+    }
+
+    #[tokio::test]
+    async fn execution_snapshots_capture_the_effective_retry_limit() {
+        for (case, retries, requirements, expected) in [
+            ("default", RetryConfig::default(), "", vec![0]),
+            ("configuration fallback", 3.into(), "", vec![3, 3, 3, 3]),
+            (
+                "requirement override",
+                3.into(),
+                "requirements { max_retries: 1 }",
+                vec![1, 1],
+            ),
+            (
+                "disabled retries",
+                RetryConfig::Disabled,
+                "requirements { max_retries: 3 }",
+                vec![0],
+            ),
+        ] {
+            let source = format!(
+                r#"
+version 1.2
+
+task test {{
+    command <<<exit 1>>>
+    {requirements}
+}}
+"#
+            );
+            let root_dir = tempdir().expect("failed to create temporary directory");
+            let mut config = Config::local();
+            config.task.retries = retries;
+
+            let (evaluated, events) =
+                evaluate_task_with_events(config, root_dir.path(), &source).await;
+            assert!(evaluated.failed(), "{case}");
+
+            let retry_limits = events
+                .iter()
+                .filter_map(|event| match event {
+                    EngineEvent::TaskExecuting { constraints, .. } => Some(constraints.max_retries),
+                    _ => None,
+                })
+                .collect::<Vec<u64>>();
+            assert_eq!(retry_limits, expected, "{case}");
+        }
     }
 
     #[tokio::test]
@@ -2657,7 +2856,7 @@ task test {
         let root_dir = tempdir().expect("failed to create temporary directory");
         let mut config = Config::default();
         config.task.cache = CallCachingMode::On;
-        config.task.cache_dir = root_dir.path().join("cache").to_string_lossy().into();
+        config.task.cache_dir = root_dir.path().join("cache");
         config
             .backends
             .insert("default".into(), LocalBackendConfig::default().into());
@@ -3447,6 +3646,85 @@ task test {
         );
     }
 
+    /// Tests for caching when a task retries.
+    #[tokio::test]
+    #[traced_test]
+    async fn cache_with_retry() {
+        const SOURCE: &str = r#"
+version 1.3
+
+task test {
+    command <<<
+        echo '~{if task.attempt == 0 then "fail" else "ok"}'
+        exit ~{if task.attempt == 0 then 1 else 0}
+    >>>
+
+    requirements {
+        max_retries: 1
+    }
+    
+    output {
+        String message = read_string(stdout())
+    }
+}
+"#;
+
+        let root_dir = tempdir().expect("failed to create temporary directory");
+        let config = create_config(CallCachingMode::On, root_dir.path());
+
+        // Evaluate the task; it should succeed due to the retry logic
+        let evaluated = evaluate_task(config.clone(), root_dir.path(), SOURCE).await;
+        assert!(!evaluated.cached());
+        assert_eq!(evaluated.exit_code(), 0);
+        assert_eq!(
+            fs::read_to_string(evaluated.stdout().as_file().unwrap().as_str())
+                .unwrap()
+                .trim(),
+            "ok"
+        );
+        assert_eq!(
+            fs::read_to_string(evaluated.stderr().as_file().unwrap().as_str()).unwrap(),
+            ""
+        );
+        assert!(logs_contain("using call cache"), "expected cache to be on");
+        assert!(
+            logs_contain("retrying execution of task `test` (retry 1)"),
+            "expected task to be retried"
+        );
+        assert!(
+            logs_contain("call cache miss"),
+            "expected first run to miss the cache"
+        );
+        assert!(
+            logs_contain("running task"),
+            "expected the task to have executed"
+        );
+
+        // Evaluate the source again; it should be served from the cache despite
+        // the previous retry
+        let evaluated = evaluate_task(config.clone(), root_dir.path(), SOURCE).await;
+        assert!(evaluated.cached());
+        assert!(
+            logs_contain("ignoring call cache entry: the command of the task was modified"),
+            "expected entry to be ignored for first attempt"
+        );
+        assert_eq!(evaluated.exit_code(), 0);
+        assert_eq!(
+            fs::read_to_string(evaluated.stdout().as_file().unwrap().as_str())
+                .unwrap()
+                .trim(),
+            "ok"
+        );
+        assert_eq!(
+            fs::read_to_string(evaluated.stderr().as_file().unwrap().as_str()).unwrap(),
+            ""
+        );
+        assert!(
+            logs_contain("task execution was skipped"),
+            "expected second attempt to skip execution"
+        );
+    }
+
     #[tokio::test]
     async fn first_cancel_completes_task() {
         let root_dir = TempDir::new().expect("failed to create temporary directory");
@@ -3487,8 +3765,12 @@ task t {
 
         let engine = Engine::new(Config::local()).await.unwrap();
         let cancellation = CancellationContext::new(FailureMode::Slow);
-        let events = Events::new(10);
-        let evaluator = engine.create_v1_evaluator(events.clone(), cancellation.clone());
+        let events = Events::default().with_crankshaft(10);
+        let evaluator = engine.create_v1_evaluator(
+            events.clone(),
+            cancellation.clone(),
+            ContainerImageOverrides::default(),
+        );
 
         let document = results
             .iter()
@@ -3530,5 +3812,193 @@ task t {
                 }
             }
         }
+    }
+
+    /// Gets the paths of an `Array[File]` output.
+    #[cfg(unix)]
+    fn file_paths(outputs: &Outputs, name: &str) -> Vec<String> {
+        outputs
+            .get(name)
+            .expect("should have output")
+            .as_array()
+            .expect("should be an array")
+            .as_slice()
+            .iter()
+            .map(|v| v.as_file().expect("should be a file").as_str().to_string())
+            .collect()
+    }
+
+    /// Tests that listed broken symbolic links are not mounted as inputs, but
+    /// remain visible through the mounted directory that contains them.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[traced_test]
+    async fn list_broken_symlink() {
+        const SOURCE: &str = r#"
+version 1.4
+
+task test {
+    input {
+        Directory directory = "DIRECTORY"
+    }
+
+    Array[File] files = list(directory).left
+
+    command <<<
+        for file in ~{sep(" ", squote(files))}; do
+            if [ -L "$file" ]; then
+                echo "link $(basename "$file")"
+                ln -s "$file" "link-$(basename "$file")"
+            elif [ -f "$file" ]; then
+                echo "file $(basename "$file")"
+            else
+                echo "missing $(basename "$file")"
+            fi
+        done
+    >>>
+
+    output {
+        Array[File] listed = files
+        File relinked = "link-broken"
+    }
+}
+"#;
+
+        let data_dir = tempdir().expect("failed to create temporary directory");
+        fs::write(data_dir.path().join("a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink("missing", data_dir.path().join("broken")).unwrap();
+        // On Unix, a backslash is part of a file name rather than a separator
+        std::os::unix::fs::symlink("missing", data_dir.path().join("back\\slash")).unwrap();
+
+        // Each root directory is a sibling of the data directory, so the data
+        // directory can also be specified relative to the document
+        let name = data_dir.path().file_name().unwrap().to_str().unwrap();
+        for directory in [
+            data_dir.path().to_str().unwrap().to_string(),
+            format!("../{name}"),
+            url::Url::from_directory_path(data_dir.path())
+                .unwrap()
+                .to_string(),
+        ] {
+            let root_dir = tempdir().expect("failed to create temporary directory");
+            let config = create_config(CallCachingMode::On, root_dir.path());
+            let source = SOURCE.replace("DIRECTORY", &directory);
+            let evaluated = evaluate_task(config, root_dir.path(), &source).await;
+            assert_eq!(evaluated.exit_code(), 0);
+            assert_eq!(
+                fs::read_to_string(evaluated.stdout().as_file().unwrap().as_str()).unwrap(),
+                "file a.txt\nlink back\\slash\nlink broken\n",
+                "unexpected stdout for directory `{directory}`"
+            );
+
+            let outputs = evaluated.into_outputs().expect("task should succeed");
+            assert_eq!(
+                file_paths(&outputs, "listed"),
+                ["a.txt", "back\\slash", "broken"].map(|n| data_dir
+                    .path()
+                    .join(n)
+                    .to_str()
+                    .unwrap()
+                    .to_string()),
+                "unexpected outputs for directory `{directory}`"
+            );
+
+            // A link to a listed broken link is remapped to its host path
+            let relinked = outputs
+                .get("relinked")
+                .expect("should have output")
+                .as_file()
+                .expect("should be a file");
+            assert_eq!(
+                fs::read_link(relinked.as_str()).unwrap(),
+                data_dir.path().join("broken"),
+                "unexpected link target for directory `{directory}`"
+            );
+        }
+
+        assert!(
+            logs_contain("task cache key is"),
+            "expected the cache key to be calculated"
+        );
+    }
+
+    /// Tests that a listed broken symbolic link outside of any directory input
+    /// maps next to its siblings, where nothing is mounted.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[traced_test]
+    async fn list_broken_symlink_outside_directory_input() {
+        const SOURCE: &str = r#"
+version 1.4
+
+task test {
+    Array[File] files = list("DIRECTORY").left
+
+    command <<<
+        for file in ~{sep(" ", squote(files))}; do
+            if [ -L "$file" ]; then
+                echo "link $file"
+            elif [ -f "$file" ]; then
+                echo "file $file"
+            else
+                echo "missing $file"
+            fi
+        done
+    >>>
+
+    output {
+        Array[File] listed = files
+    }
+}
+"#;
+
+        let data_dir = tempdir().expect("failed to create temporary directory");
+        fs::write(data_dir.path().join("a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink("missing", data_dir.path().join("broken")).unwrap();
+
+        let root_dir = tempdir().expect("failed to create temporary directory");
+        let config = create_config(CallCachingMode::On, root_dir.path());
+        let source = SOURCE.replace("DIRECTORY", data_dir.path().to_str().unwrap());
+        let evaluated = evaluate_task(config, root_dir.path(), &source).await;
+        assert_eq!(evaluated.exit_code(), 0);
+
+        let stdout = fs::read_to_string(evaluated.stdout().as_file().unwrap().as_str()).unwrap();
+        let (guest_dir, _) = stdout
+            .strip_prefix("file ")
+            .and_then(|s| s.split_once("/a.txt\n"))
+            .expect("should have the mounted file");
+        assert!(
+            guest_dir.starts_with("/mnt/task/inputs/"),
+            "unexpected guest directory `{guest_dir}`"
+        );
+        assert_eq!(
+            stdout,
+            format!("file {guest_dir}/a.txt\nmissing {guest_dir}/broken\n")
+        );
+
+        let outputs = evaluated.into_outputs().expect("task should succeed");
+        assert_eq!(
+            file_paths(&outputs, "listed"),
+            ["a.txt", "broken"].map(|n| data_dir.path().join(n).to_str().unwrap().to_string())
+        );
+        assert!(
+            logs_contain("task cache key is"),
+            "expected the cache key to be calculated"
+        );
+    }
+
+    #[test]
+    fn directory_sizes_sum_files_and_skip_symlinks() {
+        let dir = tempfile::tempdir().expect("failed to create temporary directory");
+        std::fs::write(dir.path().join("a"), vec![0u8; 100]).expect("failed to write file");
+        std::fs::create_dir(dir.path().join("sub")).expect("failed to create directory");
+        std::fs::write(dir.path().join("sub/b"), vec![0u8; 50]).expect("failed to write file");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("a"), dir.path().join("link"))
+            .expect("failed to create symlink");
+
+        let size = super::directory_size(dir.path()).expect("failed to measure directory");
+        assert_eq!(size, 150);
     }
 }

@@ -191,12 +191,15 @@ keywords = ["TODO"]
 [check.rules.UnusedDocComments]
 severity = "note"
 
+[check.rules.StructOverMap]
+severity = "off"
+
 [analyzer]
 lint = false
 
 [run]
-output_dir = "./out"
 events_capacity = 5000
+output_dir = "./out"
 backend = "default"
 suppress_env_specific_output = false
 experimental_features_enabled = false
@@ -206,7 +209,7 @@ choice_cache_capacity = 1000
 regex_cache_capacity = 1000
 
 [run.http]
-cache_dir = "system"
+cache_dir = "default"
 retries = 5
 parallelism = "available"
 hash_algorithm = "sha256"
@@ -223,7 +226,7 @@ container = "ubuntu:latest"
 shell = "bash"
 cpu_limit_behavior = "deny"
 memory_limit_behavior = "deny"
-cache_dir = "system"
+cache_dir = "default"
 cache = "off"
 digests = "weak"
 excluded_cache_requirements = []
@@ -244,7 +247,6 @@ excluded_cache_inputs = []
 host = "127.0.0.1"
 port = 8080
 allowed_origins = []
-output_dir = "./out"
 allowed_file_paths = []
 allowed_urls = []
 max_concurrent_runs = "unlimited"
@@ -254,6 +256,7 @@ orphan_timeout_minutes = 5
 url = "default"
 
 [server.engine]
+output_dir = "./out"
 backend = "default"
 suppress_env_specific_output = false
 experimental_features_enabled = false
@@ -263,7 +266,7 @@ choice_cache_capacity = 1000
 regex_cache_capacity = 1000
 
 [server.engine.http]
-cache_dir = "system"
+cache_dir = "default"
 retries = 5
 parallelism = "available"
 hash_algorithm = "sha256"
@@ -280,7 +283,7 @@ container = "ubuntu:latest"
 shell = "bash"
 cpu_limit_behavior = "deny"
 memory_limit_behavior = "deny"
-cache_dir = "system"
+cache_dir = "default"
 cache = "off"
 digests = "weak"
 excluded_cache_requirements = []
@@ -300,6 +303,7 @@ excluded_cache_inputs = []
 [test]
 parallelism = 50
 throttle = 100
+enable_custom_assertions = false
 
 [doc]
 index_page = "none"
@@ -359,3 +363,7 @@ denied_hosts = [
 ]
 allowed_hosts = []
 allowed_transitive_hosts = ["github.com", "gitlab.com"]
+
+[lock]
+
+[lock.library]

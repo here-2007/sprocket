@@ -9,6 +9,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::CancellationContext;
+use crate::ContainerImageOverrides;
 use crate::Events;
 use crate::backend::TaskExecutionBackend;
 use crate::cache::CallCache;
@@ -107,7 +108,7 @@ impl Engine {
             }
             _ => Some(
                 CallCache::new(
-                    config.task.cache_dir()?,
+                    config.call_cache_dir(),
                     config.task.digests,
                     CallCacheExclusions {
                         inputs: HashSet::from_iter(
@@ -137,8 +138,9 @@ impl Engine {
         &self,
         events: Events,
         cancellation: CancellationContext,
+        image_overrides: ContainerImageOverrides,
     ) -> v1::Evaluator {
-        v1::Evaluator::new(self, events, cancellation)
+        v1::Evaluator::new(self, events, cancellation, image_overrides)
     }
 
     /// Gets the configuration associated with the engine.

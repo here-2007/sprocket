@@ -9,12 +9,104 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-* Added `sprocket dev module schema` subcommand to generate a [JSON schema](https://json-schema.org)
-  for WDL `module.json` definitions
-  ([#1295](https://github.com/stjude-rust-labs/sprocket/pull/1295)).
+* Execution metrics include backend-reported peak and average memory and cumulative CPU time when
+  available. Local Docker containers sample these measurements every second by default; set
+  `backends.<name>.resource_usage_interval = 0` to disable sampling. Docker Swarm sampling is
+  unsupported ([#1259](https://github.com/stjude-rust-labs/sprocket/pull/1259)).
+* Execution metrics include scheduler-pending and allocated CPU time, time lost to preemption,
+  resolved retry policy and curated hints, local work directory disk usage, execution backend and
+  Sprocket version, and localization transfer volume as a data-movement proxy
+  ([#1261](https://github.com/stjude-rust-labs/sprocket/pull/1261))
+
+### Changed
+
+* The `server.output_dir` configuration setting has moved to `server.engine.output_dir`
+  ([#1372](https://github.com/stjude-rust-labs/sprocket/pull/1372)).
+* The configuration settings `run.http.cache_dir`, `run.task.cache_dir`,
+  `server.engine.http.cache_dir`, `server.engine.task.cache_dir`, and the `image_cache_dir` of
+  LSF/Slurm backends are now relative to the output directory instead of being user-wide cache
+  locations; the previous `system` value is deprecated
+  ([#1372](https://github.com/stjude-rust-labs/sprocket/pull/1372)).
+* Execution database writes batch task updates and combine related run updates to reduce commits.
+  SQLite uses `PERSIST` journaling, disables memory-mapped I/O, and limits the pool to five
+  connections. Task updates normally flush every 250 milliseconds or after 256 buffered writes;
+  database delays can extend the wait
+  ([#1260](https://github.com/stjude-rust-labs/sprocket/pull/1260)).
+* Task resource utilization updates merge reported fields into the stored JSON snapshot instead of
+  replacing it ([#1260](https://github.com/stjude-rust-labs/sprocket/pull/1260)).
 
 ### Fixed
 
+* `test.enable_custom_assertions` is assigned a proper `false` default instead of being a required
+  config entry ([#1343](https://github.com/stjude-rust-labs/sprocket/pull/1343)).
+
+## 0.33.0 - 2026-10-29
+
+### Security Fix
+
+* Fixed a security issue where `sprocket dev server` was failing to properly handle submitted
+  `file://` URLs, allowing attackers to access files outside of the allowed file system paths
+  ([GHSA-gvw2-6ff9-8364](https://github.com/stjude-rust-labs/sprocket/security/advisories/GHSA-gvw2-6ff9-8364)).
+
+### Added
+
+* Added `--aws-endpoint-url` CLI option to `sprocket run` for specifying custom S3 endpoints for a
+  specific run ([#1335](https://github.com/stjude-rust-labs/sprocket/pull/1335)).
+* Added `run.storage.s3.endpoint` and `server.storage.s3.endpoint` configuration settings to
+  `sprocket.toml` for allowing custom S3 endpoints other than AWS
+  ([#1335](https://github.com/stjude-rust-labs/sprocket/pull/1335)).
+* Added `sprocket test` command for unit testing WDL (was `sprocket dev test`)
+  ([#1293](https://github.com/stjude-rust-labs/sprocket/pull/1293)).
+* Added "custom assertions" ability to the `test` framework for running arbitrary user code on WDL
+  outputs. This added `--enable-custom-assertions` and `--trusted` flags to the `test` command and
+  an `enable_custom_assertions` field to the `[test]` configuration table in `sprocket.toml`
+  ([#1293](https://github.com/stjude-rust-labs/sprocket/pull/1293)).
+* Added `--bin-dir` flag and `bin_dir` field to `test` command and configuration table for setting a
+  custom path for test executable discovery
+  ([#1293](https://github.com/stjude-rust-labs/sprocket/pull/1293)).
+* Added `--show-assertion-stdio` flag to `test` command for displaying the STDOUT and STDERR streams
+  of running custom executables ([#1293](https://github.com/stjude-rust-labs/sprocket/pull/1293)).
+* Added `All` and `Any` assertions to the test framework for checking whether all or at least one
+  element of an output WDL array satisfies an assertion
+  ([#1318](https://github.com/stjude-rust-labs/sprocket/pull/1318)).
+* Implemented `sprocket dev lock` to pin `task` container images
+  ([#1267](https://github.com/stjude-rust-labs/sprocket/pull/1267)).
+* Added `[lock.library]` configuration section to configure
+  [Library API](https://singularityhub.github.io/library-api)-compatible image registries
+  ([#1267](https://github.com/stjude-rust-labs/sprocket/pull/1267)).
+* Added `sprocket dev module schema` subcommand to generate a [JSON schema](https://json-schema.org)
+  for WDL `module.json` definitions
+  ([#1295](https://github.com/stjude-rust-labs/sprocket/pull/1295)).
+* Added the experimental WDL 1.4 `list` function for listing a directory's files and subdirectories,
+  with recursion, symlink inclusion, and file filtering. This implements
+  [`openwdl/wdl#800`](https://github.com/openwdl/wdl/pull/800) and requires
+  `feature_flags.wdl_1_4 = true` ([#1198](https://github.com/stjude-rust-labs/sprocket/pull/1198)).
+* `dev server` now records each task execution attempt's WDL call ID, 0-based attempt number,
+  resolved execution constraints, and retry cause. Task API responses expose the same fields
+  ([#1256](https://github.com/stjude-rust-labs/sprocket/pull/1256)).
+* Added `GET /api/v1/runs/{id}/metrics`, which reports task attempts grouped by fully qualified WDL
+  call path with a short display name
+  ([#1257](https://github.com/stjude-rust-labs/sprocket/pull/1257)).
+* `sprocket dev server metrics <RUN>` renders execution metrics, with `--json` for the raw response
+  and `--call` for filtering. Local `sprocket run` executions write the same structure to
+  `metrics.json` beside `outputs.json`
+  ([#1258](https://github.com/stjude-rust-labs/sprocket/pull/1258)).
+
+### Changed
+
+* `sprocket inputs`, `sprocket validate`, `sprocket run`, and server execution now select local
+  workflows by name. WDL 1.4 documents with multiple workflows require an explicit target when one
+  cannot be inferred ([openwdl/wdl#798](https://github.com/openwdl/wdl/pull/798)).
+* The `--locked` flag in `run` now handles both module (`module-lock.json`) and container image
+  (`sprocket.lock`) lockfiles. To mimic the old module-only behavior, use `--locked=modules`
+  ([#1267](https://github.com/stjude-rust-labs/sprocket/pull/1267)).
+* `run --locked` now enforces that all `task` container images have an entry in `sprocket.lock`
+  ([#1267](https://github.com/stjude-rust-labs/sprocket/pull/1267)).
+
+### Fixed
+
+* Task stderr streams without a terminating newline are now logged in full
+  ([#1293](https://github.com/stjude-rust-labs/sprocket/pull/1293)).
 * Relative paths for `doc` configured index pages are now resolved relative to the root workspace
   being documented ([#1304](https://github.com/stjude-rust-labs/sprocket/pull/1304)).
 
@@ -918,7 +1010,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `--name` option if passed a WDL document containing a single task and no workflow
   ([#121](https://github.com/stjude-rust-labs/sprocket/pull/121)).
 * The `sprocket run` command now correctly includes the workflow/task name prefix in the output
-  ([#131](github.com/stjude-rust-labs/sprocket/pull/131)).
+  ([#131](https://github.com/stjude-rust-labs/sprocket/pull/131)).
 
 ### Added
 

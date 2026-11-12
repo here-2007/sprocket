@@ -7,6 +7,7 @@
 mod cancel;
 mod client;
 mod inspect;
+mod metrics;
 mod retry;
 mod status;
 mod submit;
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Parser;
 use clap::Subcommand;
+use url::Url;
 use wdl::engine::config::BackendConfig;
 use wdl::engine::config::TesBackendAuthConfig;
 
@@ -43,6 +45,8 @@ pub enum ServerSubcommand {
     Status(status::Args),
     /// Show detailed information about a run.
     Inspect(inspect::Args),
+    /// Show execution metrics for a run.
+    Metrics(metrics::Args),
     /// Cancel a running or queued run.
     Cancel(cancel::Args),
     /// Retry a previous run, optionally with input overrides.
@@ -74,7 +78,7 @@ pub struct StartArgs {
 
     /// Allowed URL prefixes for URL-based workflows.
     #[arg(long)]
-    pub allowed_urls: Vec<String>,
+    pub allowed_urls: Vec<Url>,
 
     /// Allowed CORS origins.
     #[arg(long)]
@@ -97,7 +101,7 @@ impl StartArgs {
         }
 
         if let Some(output_dir) = self.output_dir {
-            config.server.output_dir = output_dir;
+            config.server.engine.output_dir = output_dir;
         }
 
         config
@@ -138,7 +142,7 @@ async fn start(args: StartArgs, mut config: Config, output: CommandOutput) -> Co
         .into());
     }
 
-    crate::server::run(config, report_mode, output.colorize())
+    crate::server::run(config, report_mode, output)
         .await
         .map_err(Into::into)
 }
@@ -150,6 +154,7 @@ pub async fn server(args: Args, config: Config, output: CommandOutput) -> Comman
         ServerSubcommand::Submit(args) => submit::submit(args, config, output).await,
         ServerSubcommand::Status(args) => status::status(args, config, output).await,
         ServerSubcommand::Inspect(args) => inspect::inspect(args, config, output).await,
+        ServerSubcommand::Metrics(args) => metrics::metrics(args, config, output).await,
         ServerSubcommand::Cancel(args) => cancel::cancel(args, config, output).await,
         ServerSubcommand::Retry(args) => retry::retry(args, config, output).await,
     }

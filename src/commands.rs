@@ -145,6 +145,9 @@ pub enum Commands {
     /// Runs a task or workflow.
     Run(run::Args),
 
+    /// Runs unit tests for a WDL workspace.
+    Test(test::Args),
+
     /// Validate a set of inputs against a task or workflow.
     ///
     /// This ensures that every required input is supplied, every supplied input
@@ -166,7 +169,7 @@ pub enum Commands {
 pub enum DevCommands {
     /// Document a workspace.
     Doc(doc::Args),
-    /// Locks Docker images to a sha256 digest.
+    /// Generates a container image lock file.
     Lock(lock::Args),
     /// Create and manage WDL modules.
     #[command(subcommand)]
@@ -174,8 +177,6 @@ pub enum DevCommands {
     /// Run-management server commands (start, submit, status, inspect, cancel,
     /// retry).
     Server(server::Args),
-    /// Runs unit tests for a WDL workspace.
-    Test(test::Args),
 }
 
 /// A command operation with completed and planned forms.

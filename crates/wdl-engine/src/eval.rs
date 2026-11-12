@@ -40,8 +40,9 @@ use crate::backend::TaskExecutionConstraints;
 use crate::backend::TaskExecutionResult;
 use crate::config::FailureMode;
 use crate::http::Location;
-use crate::v1::requirements::ImageSource;
 
+mod images;
+pub use images::*;
 mod trie;
 pub mod v1;
 
@@ -581,10 +582,24 @@ pub struct TaskConstraintsSnapshot {
     /// A map of disk mount points to the initial amount of disk space
     /// allocated, in bytes.
     pub disks: BTreeMap<String, i64>,
+    /// The effective maximum number of retries for the attempt.
+    ///
+    /// Task/input requirements override the configuration default. When retries
+    /// are disabled in configuration, this is zero regardless of requirements.
+    pub max_retries: u64,
+    /// The resolved `preemptible` hint: the number of times the task may be
+    /// preempted before it must be run on non-preemptible resources.
+    pub preemptible: Option<i64>,
+    /// The resolved `max_cpu` hint, if provided.
+    pub max_cpu: Option<f64>,
+    /// The resolved `max_memory` hint in bytes, if provided.
+    pub max_memory: Option<i64>,
 }
 
-impl From<&TaskExecutionConstraints> for TaskConstraintsSnapshot {
-    fn from(constraints: &TaskExecutionConstraints) -> Self {
+impl TaskConstraintsSnapshot {
+    /// Constructs a snapshot with the resolved execution constraints and retry
+    /// limit.
+    pub fn new(constraints: &TaskExecutionConstraints, max_retries: u64) -> Self {
         Self {
             container: constraints.sources.first().map(ImageSource::uri),
             cpu: constraints.cpu,
@@ -596,6 +611,10 @@ impl From<&TaskExecutionConstraints> for TaskConstraintsSnapshot {
                 .iter()
                 .map(|(k, v)| (k.clone(), *v))
                 .collect(),
+            max_retries,
+            preemptible: None,
+            max_cpu: None,
+            max_memory: None,
         }
     }
 }
@@ -663,6 +682,23 @@ pub enum EngineEvent {
         /// The unique name of the task for this attempt.
         name: String,
     },
+    /// The disk space used by a task execution attempt's work directory.
+    ///
+    /// Measured by the engine after the attempt's execution returns, when the
+    /// work directory is on a local file system; attempts whose work
+    /// directory is remote (e.g. on the TES backend) do not report it. This
+    /// complements the scheduler-observed measurements a backend may report
+    /// through Crankshaft's `TaskResourceUsage` event.
+    ///
+    /// Note: this measures the directory's size at the end of execution, not
+    /// its high-water mark, and does not include scratch space written
+    /// outside the work directory.
+    TaskDiskUsage {
+        /// The unique name of the task for this attempt.
+        name: String,
+        /// The size of the attempt's work directory, in bytes.
+        disk_used: u64,
+    },
     /// A locally running task has been parked by the engine due to insufficient
     /// resources.
     TaskParked,
@@ -676,6 +712,8 @@ pub enum EngineEvent {
 /// Represents events that may be sent during WDL evaluation.
 ///
 /// This type is cheaply cloned.
+///
+/// By default, no event channels are enabled.
 #[derive(Debug, Clone, Default)]
 pub struct Events {
     /// The WDL engine events channel.
@@ -693,18 +731,33 @@ pub struct Events {
 }
 
 impl Events {
-    /// Constructs a new `Events` and enables subscribing to all event channels.
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            engine: Some(broadcast::Sender::new(capacity)),
-            crankshaft: Some(broadcast::Sender::new(capacity)),
-            transfer: Some(broadcast::Sender::new(capacity)),
-        }
+    /// Enables WDL engine events using the given capacity for the event
+    /// channel.
+    ///
+    /// If WDL engine events were previously enabled, the sender of the previous
+    /// event channel will be closed.
+    pub fn with_engine(mut self, capacity: usize) -> Self {
+        self.engine = Some(broadcast::Sender::new(capacity));
+        self
     }
 
-    /// Constructs a new `Events` and disable subscribing to any event channel.
-    pub fn disabled() -> Self {
-        Self::default()
+    /// Enables Crankshaft events using the given capacity for the event
+    /// channel.
+    ///
+    /// If Crankshaft events were previously enabled, the sender of the previous
+    /// event channel will be closed.
+    pub fn with_crankshaft(mut self, capacity: usize) -> Self {
+        self.crankshaft = Some(broadcast::Sender::new(capacity));
+        self
+    }
+
+    /// Enables transfer events using the given capacity for the event channel.
+    ///
+    /// If transfer events were previously enabled, the sender of the previous
+    /// event channel will be closed.
+    pub fn with_transfer(mut self, capacity: usize) -> Self {
+        self.transfer = Some(broadcast::Sender::new(capacity));
+        self
     }
 
     /// Subscribes to the WDL engine events channel.
@@ -1155,7 +1208,10 @@ impl EvaluatedTask {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
+    use crate::LibraryApiSpec;
 
     #[test]
     fn cancellation_slow() {
@@ -1436,7 +1492,9 @@ mod tests {
     #[test]
     fn constraints_snapshot_captures_the_resolved_resources() {
         let constraints = TaskExecutionConstraints {
-            sources: vec![ImageSource::Library("example.org/tools/tool:1".to_string())],
+            sources: vec![ImageSource::Library(
+                LibraryApiSpec::from_str("example.org/tools/tool:1").unwrap(),
+            )],
             cpu: 4.0,
             memory: 8 * 1024 * 1024 * 1024,
             gpu: vec!["nvidia-tesla-t4".to_string()],
@@ -1444,11 +1502,17 @@ mod tests {
             disks: [("/".to_string(), 10i64)].into_iter().collect(),
         };
 
-        let snapshot = TaskConstraintsSnapshot::from(&constraints);
+        let snapshot = TaskConstraintsSnapshot::new(&constraints, 3);
         assert_eq!(
             snapshot.container.as_deref(),
             Some("library://example.org/tools/tool:1")
         );
+        assert_eq!(snapshot.max_retries, 3);
+        // The curated hints are populated at emission, not from the
+        // constraints.
+        assert_eq!(snapshot.preemptible, None);
+        assert_eq!(snapshot.max_cpu, None);
+        assert_eq!(snapshot.max_memory, None);
         assert_eq!(snapshot.cpu, 4.0);
         assert_eq!(snapshot.memory, 8 * 1024 * 1024 * 1024);
         assert_eq!(snapshot.gpu, ["nvidia-tesla-t4"]);
